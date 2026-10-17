@@ -176,3 +176,20 @@ fn eval_error_has_backtrace() {
         }
     }
 }
+
+#[test]
+fn native_error_kind_ignores_script_visible_properties() {
+    use crate::builtins::error::ErrorKind;
+
+    let mut context = Context::default();
+    let error = context.eval(Source::from_bytes(
+        "let e = new TypeError('x'); Object.defineProperty(e, 'message', {get() { throw new Error('getter'); }}); e.name = 'SyntaxError'; e.constructor = SyntaxError; throw e;",
+    )).unwrap_err();
+    assert_eq!(error.native_error_kind(), Some(ErrorKind::Type));
+    assert!(error.try_native(&mut context).is_err());
+
+    let spoof = context.eval(Source::from_bytes(
+        "throw {name: 'TypeError', constructor: TypeError};",
+    )).unwrap_err();
+    assert_eq!(spoof.native_error_kind(), None);
+}

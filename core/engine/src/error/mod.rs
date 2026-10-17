@@ -395,6 +395,26 @@ impl EngineError {
 }
 
 impl JsError {
+    /// Return the VM's native Error brand without reading script-visible
+    /// properties. An arbitrary thrown value has no native error kind.
+    #[must_use]
+    pub fn native_error_kind(&self) -> Option<ErrorKind> {
+        match &self.inner {
+            Repr::Opaque(value) => value.as_object()?.downcast_ref::<Error>().map(|error| error.tag),
+            Repr::Native(error) => Some(match error.kind() {
+                JsNativeErrorKind::Aggregate(_) => ErrorKind::Aggregate,
+                JsNativeErrorKind::Error => ErrorKind::Error,
+                JsNativeErrorKind::Eval => ErrorKind::Eval,
+                JsNativeErrorKind::Range => ErrorKind::Range,
+                JsNativeErrorKind::Reference => ErrorKind::Reference,
+                JsNativeErrorKind::Syntax => ErrorKind::Syntax,
+                JsNativeErrorKind::Type => ErrorKind::Type,
+                JsNativeErrorKind::Uri => ErrorKind::Uri,
+                _ => return None,
+            }),
+            Repr::Engine(_) => None,
+        }
+    }
     /// Creates a new `JsError` from a native error `err`.
     ///
     /// # Examples
