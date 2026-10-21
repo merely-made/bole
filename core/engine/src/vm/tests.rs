@@ -593,3 +593,29 @@ fn caught_exceptions_do_not_leak_value_stack() {
         ),
     ]);
 }
+
+#[test]
+fn exceptions_out_of_host_calls_do_not_leak_value_stack() {
+    // A promise reaction handler is run through a host call (an exit-early frame). When it
+    // threw from a nested call, the nested frames were left on the value stack, because the
+    // host caller pops the frame without truncating the stack.
+    run_test_actions([
+        TestAction::inspect_context(|context| {
+            context.runtime_limits_mut().set_stack_size_limit(1024);
+        }),
+        TestAction::run(indoc! {r#"
+            function inner(i) { throw new Error("e" + i); }
+            function outer(i, b, c) { return inner(i); }
+            var rejected = 0;
+            for (let i = 0; i < 5000; i++) {
+                Promise.reject(i).then(null, function (e) { outer(e, 1, 2); }).catch(function () { rejected++; });
+            }
+        "#}),
+        TestAction::inspect_context(|context| {
+            context
+                .run_jobs()
+                .expect("jobs must not hit a runtime limit");
+        }),
+        TestAction::assert_eq("rejected", JsValue::new(5_000)),
+    ]);
+}

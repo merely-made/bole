@@ -936,6 +936,11 @@ impl Context {
             }
 
             if exit_early {
+                // The host caller pops this frame without touching the value stack, so drop
+                // the unwound callees' frames and registers here, as the branch above does.
+                self.vm.frame_mut().environments.truncate(env_fp as usize);
+                let frame = self.vm.frames.last().expect("frame must exist");
+                self.vm.stack.truncate_to_frame(frame);
                 return ControlFlow::Break(CompletionRecord::Throw(
                     self.vm
                         .pending_exception
