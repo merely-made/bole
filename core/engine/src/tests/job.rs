@@ -7,7 +7,7 @@ use std::{
 use futures_lite::future;
 
 use crate::{
-    JsValue, TestAction,
+    Context, JsNativeError, JsResult, JsValue, TestAction,
     context::{ContextBuilder, time::FixedClock},
     job::{GenericJob, JobExecutor, NativeAsyncJob, SimpleJobExecutor},
     run_test_actions_with,
@@ -68,4 +68,43 @@ fn test_async_job_not_blocking_event_loop() {
         })],
         context,
     );
+}
+
+/// Queue `ok`, a failing job, then `ok` again, run the queue, and report how many `ok` jobs ran
+/// and whether `run_jobs` returned the failure.
+fn run_around_a_failing_job(executor: SimpleJobExecutor) -> (u32, bool) {
+    let ran = Rc::new(Cell::new(0u32));
+    let mut context = ContextBuilder::default()
+        .job_executor(Rc::new(executor))
+        .build()
+        .unwrap();
+    let realm = context.realm().clone();
+    for step in 0..3 {
+        let ran = ran.clone();
+        let job = GenericJob::new(
+            move |_: &mut Context| -> JsResult<JsValue> {
+                if step == 1 {
+                    return Err(JsNativeError::typ().with_message("boom").into());
+                }
+                ran.set(ran.get() + 1);
+                Ok(JsValue::undefined())
+            },
+            realm.clone(),
+        );
+        context.enqueue_job(job.into());
+    }
+    let failed = context.run_jobs().is_err();
+    (ran.get(), failed)
+}
+
+#[test]
+fn job_error_clears_the_queue_by_default() {
+    // The default stays "bail on the first error": the job queued after the failure is lost.
+    assert_eq!(run_around_a_failing_job(SimpleJobExecutor::new()), (1, true));
+}
+
+#[test]
+fn continue_on_error_keeps_the_rest_of_the_queue_and_returns_the_first_error() {
+    let executor = SimpleJobExecutor::new().with_continue_on_error(true);
+    assert_eq!(run_around_a_failing_job(executor), (2, true));
 }
