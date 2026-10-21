@@ -33,7 +33,7 @@
 use crate::context::time::{JsDuration, JsInstant};
 use crate::sys::time;
 use crate::{
-    Context, JsResult, JsValue,
+    Context, JsError, JsResult, JsValue,
     object::{JsFunction, NativeObject},
     realm::Realm,
 };
@@ -865,6 +865,9 @@ impl ClockJob {
 /// This is the default job executor for the [`Context`], but it is mostly pretty limited
 /// for a custom event loop.
 ///
+/// Bailing drops every job still queued. An embedder that cannot afford to lose them can opt
+/// out with [`SimpleJobExecutor::with_continue_on_error`].
+///
 /// To disable running promise jobs on the engine, see [`IdleJobExecutor`].
 #[derive(Default)]
 pub struct SimpleJobExecutor {
@@ -874,9 +877,23 @@ pub struct SimpleJobExecutor {
     clock_jobs: RefCell<BTreeMap<JsInstant, Vec<ClockJob>>>,
     generic_jobs: RefCell<VecDeque<GenericJob>>,
     stop: Arc<AtomicBool>,
+    continue_on_error: bool,
 }
 
 impl SimpleJobExecutor {
+    /// Decides what a job error does to the run. By default the queue is cleared and the error
+    /// is handed back to bail with. With `continue_on_error` the error is kept in `first` (the
+    /// earliest one wins), the queue is left alone, and `None` means "keep going".
+    fn on_job_error(&self, err: JsError, first: &mut Option<JsError>) -> Option<JsError> {
+        if self.continue_on_error {
+            first.get_or_insert(err);
+            None
+        } else {
+            self.clear();
+            Some(err)
+        }
+    }
+
     fn clear(&self) {
         self.promise_jobs.borrow_mut().clear();
         self.async_jobs.borrow_mut().clear();
@@ -896,6 +913,17 @@ impl SimpleJobExecutor {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Sets whether a failing job leaves the other queued jobs alone.
+    ///
+    /// By default the first job error clears the whole queue and is returned at once, so every
+    /// pending job is silently lost. With `true` the remaining jobs still run, and
+    /// [`run_jobs`](JobExecutor::run_jobs) returns the first error once the queue has drained.
+    #[must_use]
+    pub fn with_continue_on_error(mut self, continue_on_error: bool) -> Self {
+        self.continue_on_error = continue_on_error;
+        self
     }
 
     /// Gets the cancellation token for this executor.
@@ -952,11 +980,13 @@ impl JobExecutor for SimpleJobExecutor {
     {
         let mut group = FutureGroup::new();
         let mut fr_group = FutureGroup::new();
+        // Only ever filled when `continue_on_error` is set.
+        let mut first_error = None;
         loop {
             if self.stop.load(Ordering::Relaxed) {
                 self.stop.store(false, Ordering::Relaxed);
                 self.clear();
-                return Ok(());
+                return first_error.map_or(Ok(()), Err);
             }
 
             for job in mem::take(&mut *self.async_jobs.borrow_mut()) {
@@ -992,16 +1022,18 @@ impl JobExecutor for SimpleJobExecutor {
                             match job {
                                 ClockJob::Timeout(job) => {
                                     if let Err(err) = job.call(&mut context.borrow_mut()) {
-                                        self.clear();
-                                        return Err(err);
+                                        if let Some(err) = self.on_job_error(err, &mut first_error) {
+                                            return Err(err);
+                                        }
                                     }
                                 }
                                 ClockJob::Interval(job) => {
                                     let context = &mut context.borrow_mut();
                                     let now = context.clock().now();
                                     if let Err(err) = job.call(context) {
-                                        self.clear();
-                                        return Err(err);
+                                        if let Some(err) = self.on_job_error(err, &mut first_error) {
+                                            return Err(err);
+                                        }
                                     }
                                     self.clock_jobs
                                         .borrow_mut()
@@ -1018,8 +1050,9 @@ impl JobExecutor for SimpleJobExecutor {
             if self.is_empty() && group.is_empty() {
                 match future::poll_once(fr_group.next()).await.flatten() {
                     Some(Err(err)) => {
-                        self.clear();
-                        return Err(err);
+                        if let Some(err) = self.on_job_error(err, &mut first_error) {
+                            return Err(err);
+                        }
                     }
                     // A single registry cleanup future can complete while other registry
                     // waiters remain pending. Continue the loop so each already-ready cleanup
@@ -1031,29 +1064,32 @@ impl JobExecutor for SimpleJobExecutor {
             }
 
             if let Some(Err(err)) = future::poll_once(group.next()).await.flatten() {
-                self.clear();
-                return Err(err);
+                if let Some(err) = self.on_job_error(err, &mut first_error) {
+                    return Err(err);
+                }
             }
 
             let jobs = mem::take(&mut *self.promise_jobs.borrow_mut());
             for job in jobs {
                 if let Err(err) = job.call(&mut context.borrow_mut()) {
-                    self.clear();
-                    return Err(err);
+                    if let Some(err) = self.on_job_error(err, &mut first_error) {
+                        return Err(err);
+                    }
                 }
             }
 
             let jobs = mem::take(&mut *self.generic_jobs.borrow_mut());
             for job in jobs {
                 if let Err(err) = job.call(&mut context.borrow_mut()) {
-                    self.clear();
-                    return Err(err);
+                    if let Some(err) = self.on_job_error(err, &mut first_error) {
+                        return Err(err);
+                    }
                 }
             }
             context.borrow_mut().clear_kept_objects();
             future::yield_now().await;
         }
 
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 }
