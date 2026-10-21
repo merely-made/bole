@@ -533,3 +533,63 @@ fn recursion_in_setter_throws_uncatchable_error() {
         ),
     ]);
 }
+
+#[test]
+fn caught_exceptions_do_not_leak_value_stack() {
+    // Each exception thrown from a callee and caught by the caller used to leave the
+    // callee's registers (and the caller's in-flight call setup) on the value stack
+    // until the caller returned, so a loop of caught throws hit `StackSize`.
+    run_test_actions([
+        TestAction::inspect_context(|context| {
+            context.runtime_limits_mut().set_stack_size_limit(1024);
+        }),
+        TestAction::assert_eq(
+            indoc! {r#"
+                function thrower(i) { throw new Error("e" + i); }
+                function viaCall(a, b, c) { return thrower(a); }
+                let caught = 0;
+                for (let i = 0; i < 20000; i++) {
+                    try { viaCall(i, 1, 2); } catch (e) { caught++; }
+                }
+                caught
+            "#},
+            JsValue::new(20_000),
+        ),
+        // Through a native frame, with arguments still being evaluated at the throw.
+        TestAction::assert_eq(
+            indoc! {r#"
+                function thrower2() { throw 1; }
+                function sum() { return 0; }
+                let caught2 = 0;
+                for (let i = 0; i < 20000; i++) {
+                    try { sum(1, 2, Reflect.apply(thrower2, null, [])); } catch (e) { caught2++; }
+                }
+                caught2
+            "#},
+            JsValue::new(20_000),
+        ),
+        // Locals and the catch binding stay intact after the unwind.
+        TestAction::assert_eq(
+            indoc! {r#"
+                function t() { throw "boom"; }
+                function f() {
+                    let a = 1, b = [2], c = { d: 3 };
+                    try { Math.max(a, b[0], t()); } catch (e) { return a + b[0] + c.d + e.length; }
+                }
+                f()
+            "#},
+            JsValue::new(10),
+        ),
+        // Generators and async functions that catch.
+        TestAction::assert_eq(
+            indoc! {r#"
+                function t() { throw 1; }
+                function* g() { for (let i = 0; i < 5000; i++) { try { t(); } catch (e) { yield i; } } }
+                let n = 0;
+                for (const v of g()) { n++; }
+                n
+            "#},
+            JsValue::new(5_000),
+        ),
+    ]);
+}

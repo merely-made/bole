@@ -655,6 +655,13 @@ impl Vm {
         // Go to handler location.
         frame.pc = u32::from(catch_address);
 
+        // Only this frame's registers are live at a handler. Whatever the unwound
+        // callees pushed (their frames and registers) and this frame's own
+        // in-flight call setup (`this`, function, arguments) sits above them and
+        // is dead; left in place it accumulates for every caught exception.
+        let live_end = frame.rp as usize + frame.code_block().register_count as usize;
+        self.stack.stack.truncate(live_end);
+
         self.frame_mut()
             .environments
             .truncate(environment_sp as usize);
