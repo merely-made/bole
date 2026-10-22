@@ -413,7 +413,6 @@ impl JsError {
                 JsNativeErrorKind::Syntax => ErrorKind::Syntax,
                 JsNativeErrorKind::Type => ErrorKind::Type,
                 JsNativeErrorKind::Uri => ErrorKind::Uri,
-                _ => return None,
             }),
             Repr::Engine(_) => None,
         }
