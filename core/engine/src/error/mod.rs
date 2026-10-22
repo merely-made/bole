@@ -400,7 +400,10 @@ impl JsError {
     #[must_use]
     pub fn native_error_kind(&self) -> Option<ErrorKind> {
         match &self.inner {
-            Repr::Opaque(value) => value.as_object()?.downcast_ref::<Error>().map(|error| error.tag),
+            Repr::Opaque(value) => value
+                .as_object()?
+                .downcast_ref::<Error>()
+                .map(|error| error.tag),
             Repr::Native(error) => Some(match error.kind() {
                 JsNativeErrorKind::Aggregate(_) => ErrorKind::Aggregate,
                 JsNativeErrorKind::Error => ErrorKind::Error,
