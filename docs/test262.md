@@ -47,3 +47,7 @@ the individual tests listed there under `tests`. Ignored features:
 `decorators`, `uint8array-base64`, `source-phase-imports-module-source`,
 `immutable-arraybuffer`, `iterator-includes`, `iterator-chunking`,
 `Iterator.prototype.join`, `error-stack-accessor`, `caller`.
+
+`spec-results.toml` at the repository root mirrors the with-Intl counts for the
+family spec registry on merelyllc.com, which reads it from this branch. Update
+it with these tables.
