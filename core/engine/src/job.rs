@@ -1022,7 +1022,8 @@ impl JobExecutor for SimpleJobExecutor {
                             match job {
                                 ClockJob::Timeout(job) => {
                                     if let Err(err) = job.call(&mut context.borrow_mut()) {
-                                        if let Some(err) = self.on_job_error(err, &mut first_error) {
+                                        if let Some(err) = self.on_job_error(err, &mut first_error)
+                                        {
                                             return Err(err);
                                         }
                                     }
@@ -1031,7 +1032,8 @@ impl JobExecutor for SimpleJobExecutor {
                                     let context = &mut context.borrow_mut();
                                     let now = context.clock().now();
                                     if let Err(err) = job.call(context) {
-                                        if let Some(err) = self.on_job_error(err, &mut first_error) {
+                                        if let Some(err) = self.on_job_error(err, &mut first_error)
+                                        {
                                             return Err(err);
                                         }
                                     }

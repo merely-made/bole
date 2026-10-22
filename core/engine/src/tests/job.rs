@@ -100,7 +100,10 @@ fn run_around_a_failing_job(executor: SimpleJobExecutor) -> (u32, bool) {
 #[test]
 fn job_error_clears_the_queue_by_default() {
     // The default stays "bail on the first error": the job queued after the failure is lost.
-    assert_eq!(run_around_a_failing_job(SimpleJobExecutor::new()), (1, true));
+    assert_eq!(
+        run_around_a_failing_job(SimpleJobExecutor::new()),
+        (1, true)
+    );
 }
 
 #[test]
