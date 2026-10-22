@@ -883,14 +883,14 @@ pub struct SimpleJobExecutor {
 impl SimpleJobExecutor {
     /// Decides what a job error does to the run. By default the queue is cleared and the error
     /// is handed back to bail with. With `continue_on_error` the error is kept in `first` (the
-    /// earliest one wins), the queue is left alone, and `None` means "keep going".
-    fn on_job_error(&self, err: JsError, first: &mut Option<JsError>) -> Option<JsError> {
+    /// earliest one wins) and the queue is left alone.
+    fn on_job_error(&self, err: JsError, first: &mut Option<JsError>) -> JsResult<()> {
         if self.continue_on_error {
             first.get_or_insert(err);
-            None
+            Ok(())
         } else {
             self.clear();
-            Some(err)
+            Err(err)
         }
     }
 
@@ -1022,20 +1022,14 @@ impl JobExecutor for SimpleJobExecutor {
                             match job {
                                 ClockJob::Timeout(job) => {
                                     if let Err(err) = job.call(&mut context.borrow_mut()) {
-                                        if let Some(err) = self.on_job_error(err, &mut first_error)
-                                        {
-                                            return Err(err);
-                                        }
+                                        self.on_job_error(err, &mut first_error)?;
                                     }
                                 }
                                 ClockJob::Interval(job) => {
                                     let context = &mut context.borrow_mut();
                                     let now = context.clock().now();
                                     if let Err(err) = job.call(context) {
-                                        if let Some(err) = self.on_job_error(err, &mut first_error)
-                                        {
-                                            return Err(err);
-                                        }
+                                        self.on_job_error(err, &mut first_error)?;
                                     }
                                     self.clock_jobs
                                         .borrow_mut()
@@ -1052,9 +1046,7 @@ impl JobExecutor for SimpleJobExecutor {
             if self.is_empty() && group.is_empty() {
                 match future::poll_once(fr_group.next()).await.flatten() {
                     Some(Err(err)) => {
-                        if let Some(err) = self.on_job_error(err, &mut first_error) {
-                            return Err(err);
-                        }
+                        self.on_job_error(err, &mut first_error)?;
                     }
                     // A single registry cleanup future can complete while other registry
                     // waiters remain pending. Continue the loop so each already-ready cleanup
@@ -1066,26 +1058,20 @@ impl JobExecutor for SimpleJobExecutor {
             }
 
             if let Some(Err(err)) = future::poll_once(group.next()).await.flatten() {
-                if let Some(err) = self.on_job_error(err, &mut first_error) {
-                    return Err(err);
-                }
+                self.on_job_error(err, &mut first_error)?;
             }
 
             let jobs = mem::take(&mut *self.promise_jobs.borrow_mut());
             for job in jobs {
                 if let Err(err) = job.call(&mut context.borrow_mut()) {
-                    if let Some(err) = self.on_job_error(err, &mut first_error) {
-                        return Err(err);
-                    }
+                    self.on_job_error(err, &mut first_error)?;
                 }
             }
 
             let jobs = mem::take(&mut *self.generic_jobs.borrow_mut());
             for job in jobs {
                 if let Err(err) = job.call(&mut context.borrow_mut()) {
-                    if let Some(err) = self.on_job_error(err, &mut first_error) {
-                        return Err(err);
-                    }
+                    self.on_job_error(err, &mut first_error)?;
                 }
             }
             context.borrow_mut().clear_kept_objects();
