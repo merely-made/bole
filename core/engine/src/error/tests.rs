@@ -188,8 +188,10 @@ fn native_error_kind_ignores_script_visible_properties() {
     assert_eq!(error.native_error_kind(), Some(ErrorKind::Type));
     assert!(error.try_native(&mut context).is_err());
 
-    let spoof = context.eval(Source::from_bytes(
-        "throw {name: 'TypeError', constructor: TypeError};",
-    )).unwrap_err();
+    let spoof = context
+        .eval(Source::from_bytes(
+            "throw {name: 'TypeError', constructor: TypeError};",
+        ))
+        .unwrap_err();
     assert_eq!(spoof.native_error_kind(), None);
 }
