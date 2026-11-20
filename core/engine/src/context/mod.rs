@@ -18,6 +18,7 @@ use timezone_provider::experimental_tzif::ZeroCompiledTzdbProvider;
 use crate::job::Job;
 use crate::js_error;
 use crate::module::DynModuleLoader;
+use crate::property::CompletePropertyDescriptor;
 use crate::vm::{CodeBlock, RuntimeLimits, create_function_object_fast};
 use crate::{
     HostDefined, JsNativeError, JsResult, JsString, JsValue, Source, builtins,
@@ -106,10 +107,6 @@ pub struct Context {
     pub(crate) vm: Vm,
 
     pub(crate) kept_alive: Vec<JsObject>,
-
-    /// Caller realms saved while native functions temporarily replace the
-    /// running frame's realm. Unlike a script call, a native call has no frame.
-    pub(crate) native_caller_realms: Vec<(usize, Realm)>,
 
     can_block: bool,
 
@@ -469,18 +466,19 @@ impl Context {
 
     /// Returns the nearest authored ECMAScript caller's realm during a native call.
     ///
-    /// Native calls swap the current script frame's realm without pushing a
-    /// script frame. The oldest saved realm at this frame depth precedes every
-    /// native trampoline (`call`, `apply`, constructors) on that frame. A native
-    /// invoking an authored callback pushes a new script frame and therefore
-    /// starts a new provenance chain. This is not HTML's backup incumbent stack.
+    /// Native calls push lightweight frames. Walk past native trampolines to
+    /// the nearest script frame. Outside a native call there is no caller realm.
     #[must_use]
     pub fn native_caller_realm(&self) -> Option<&Realm> {
-        let depth = self.vm.frames.len();
-        self.native_caller_realms
-            .iter()
-            .find(|(caller_depth, _)| *caller_depth == depth)
-            .map(|(_, realm)| realm)
+        use crate::vm::CallFrameFlags;
+
+        let mut frames = self.vm.frames.iter().rev();
+        if !frames.next()?.flags.contains(CallFrameFlags::NATIVE_FRAME) {
+            return None;
+        }
+        frames
+            .find(|frame| !frame.flags.contains(CallFrameFlags::NATIVE_FRAME))
+            .map(|frame| &frame.realm)
     }
 
     /// Set the value of trace on the context
@@ -538,9 +536,16 @@ impl Context {
     /// The stack trace is returned ordered with the most recent frames first.
     #[inline]
     pub fn stack_trace(&self) -> impl Iterator<Item = &CallFrame> {
+        use crate::vm::CallFrameFlags;
         // The first frame is always a dummy frame (see `Vm` implementation for more details),
-        // so skip the dummy frame and return the reversed list so that the most recent frames are first.
-        self.vm.frames.iter().skip(1).rev()
+        // so skip the dummy frame, filter out lightweight native frames, and return the reversed
+        // list so that the most recent frames are first.
+        self.vm
+            .frames
+            .iter()
+            .skip(1)
+            .filter(|f| !f.flags.contains(CallFrameFlags::NATIVE_FRAME))
+            .rev()
     }
 
     /// Replaces the currently active realm with `realm`, and returns the old realm.
@@ -668,11 +673,6 @@ impl Context {
         self.module_loader.clone()
     }
 
-    /// Swaps the currently active realm with `realm`.
-    pub(crate) fn swap_realm(&mut self, realm: &mut Realm) {
-        std::mem::swap(&mut self.vm.frame_mut().realm, realm);
-    }
-
     /// Increment and get the parser identifier.
     pub(crate) fn next_parser_identifier(&mut self) -> u32 {
         self.parser_identifier += 1;
@@ -700,14 +700,16 @@ impl Context {
         };
 
         // 5. If existingProp.[[Configurable]] is true, return true.
-        if existing_prop.configurable() == Some(true) {
+        if existing_prop.configurable() {
             return Ok(true);
         }
 
         // 6. If IsDataDescriptor(existingProp) is true and existingProp has attribute values { [[Writable]]: true, [[Enumerable]]: true }, return true.
-        if existing_prop.is_data_descriptor()
-            && existing_prop.writable() == Some(true)
-            && existing_prop.enumerable() == Some(true)
+        if let CompletePropertyDescriptor::Data {
+            writable: true,
+            enumerable: true,
+            ..
+        } = existing_prop
         {
             return Ok(true);
         }
@@ -803,9 +805,7 @@ impl Context {
             global_object.__get_own_property__(&name.clone().into(), &mut self.into())?;
 
         // 4. If existingProp is undefined or existingProp.[[Configurable]] is true, then
-        let desc = if existing_prop.is_none()
-            || existing_prop.and_then(|p| p.configurable()) == Some(true)
-        {
+        let desc = if existing_prop.is_none_or(|p| p.configurable()) {
             // a. Let desc be the PropertyDescriptor { [[Value]]: V, [[Writable]]: true, [[Enumerable]]: true, [[Configurable]]: D }.
             PropertyDescriptor::builder()
                 .value(function.clone())
@@ -855,7 +855,7 @@ impl Context {
         };
 
         // 5. If existingProp.[[Configurable]] is true, return false.
-        if existing_prop.configurable() == Some(true) {
+        if existing_prop.configurable() {
             return Ok(false);
         }
 
@@ -1272,7 +1272,6 @@ impl ContextBuilder {
             #[cfg(feature = "fuzz")]
             instructions_remaining: self.instructions_remaining,
             kept_alive: Vec::new(),
-            native_caller_realms: Vec::new(),
             host_hooks,
             clock,
             job_executor,
