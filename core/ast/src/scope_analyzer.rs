@@ -50,7 +50,6 @@ where
     let mut visitor = BindingCollectorVisitor {
         strict,
         eval,
-        in_arrow: false,
         scope: scope.clone(),
         interner,
     };
@@ -578,7 +577,6 @@ struct BindingCollectorVisitor<'interner> {
     strict: bool,
     eval: bool,
     scope: Scope,
-    in_arrow: bool,
     interner: &'interner Interner,
 }
 
@@ -589,10 +587,7 @@ impl<'ast> VisitorMut<'ast> for BindingCollectorVisitor<'_> {
         &mut self,
         _node: &'ast mut crate::expression::This,
     ) -> ControlFlow<Self::BreakTy> {
-        // NOTE: Arrow functions inherit 'this' from their enclosing scope, so we must escape it.
-        if self.in_arrow {
-            self.scope.escape_this_in_enclosing_function_scope();
-        }
+        self.scope.escape_this_in_enclosing_function_scope();
         ControlFlow::Continue(())
     }
 
@@ -1180,17 +1175,20 @@ impl BindingCollectorVisitor<'_> {
         arrow: bool,
     ) -> ControlFlow<&'static str> {
         let strict = self.strict || strict;
-        let old_in_arrow = self.in_arrow;
-        self.in_arrow = arrow;
 
-        let function_scope = if let Some(name) = name {
+        let parent_scope = if let Some(name) = name {
             let scope = Scope::new(self.scope.clone(), false);
             let name = name.to_js_string(self.interner);
             scope.create_immutable_binding(name, strict);
             *name_scope = Some(scope.clone());
-            Scope::new(scope, true)
+            scope
         } else {
-            Scope::new(self.scope.clone(), true)
+            self.scope.clone()
+        };
+        let function_scope = if arrow {
+            Scope::new_arrow(parent_scope)
+        } else {
+            Scope::new(parent_scope, true)
         };
 
         let function_scopes = function_declaration_instantiation(
@@ -1214,8 +1212,6 @@ impl BindingCollectorVisitor<'_> {
         std::mem::swap(&mut self.scope, &mut body_scope);
 
         *scopes = function_scopes;
-
-        self.in_arrow = old_in_arrow;
 
         ControlFlow::Continue(())
     }

@@ -78,7 +78,7 @@ impl Debug for Scope {
             .field("outer", &self.inner.outer)
             .field("index", &self.inner.index)
             .field("bindings", &self.inner.bindings)
-            .field("function", &self.inner.function)
+            .field("function", &self.is_function())
             .finish()
     }
 }
@@ -96,13 +96,20 @@ impl<'a> arbitrary::Arbitrary<'a> for Scope {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScopeKind {
+    Declarative,
+    Function,
+    Arrow,
+}
+
 #[derive(Debug, PartialEq)]
 pub(crate) struct Inner {
     unique_id: u32,
     outer: Option<Scope>,
     index: Cell<u32>,
     bindings: RefCell<Vec<Binding>>,
-    function: bool,
+    kind: ScopeKind,
     // Has the `this` been accessed/escaped outside the function environment boundary.
     this_escaped: Cell<bool>,
 
@@ -119,7 +126,7 @@ impl Scope {
                 outer: None,
                 index: Cell::default(),
                 bindings: RefCell::default(),
-                function: true,
+                kind: ScopeKind::Function,
                 this_escaped: Cell::new(false),
                 context: Rc::default(),
             }),
@@ -129,12 +136,25 @@ impl Scope {
     /// Creates a new scope.
     #[must_use]
     pub fn new(parent: Self, function: bool) -> Self {
+        let kind = if function {
+            ScopeKind::Function
+        } else {
+            ScopeKind::Declarative
+        };
+        Self::with_kind(parent, kind)
+    }
+
+    pub(crate) fn new_arrow(parent: Self) -> Self {
+        Self::with_kind(parent, ScopeKind::Arrow)
+    }
+
+    fn with_kind(parent: Self, kind: ScopeKind) -> Self {
         Self {
             inner: Rc::new(Inner {
                 unique_id: parent.inner.context.next_unique_id(),
                 index: Cell::new(parent.inner.index.get() + 1),
                 bindings: RefCell::default(),
-                function,
+                kind,
                 this_escaped: Cell::new(false),
                 context: parent.inner.context.clone(),
                 outer: Some(parent),
@@ -145,7 +165,6 @@ impl Scope {
     /// Checks if the scope has only local bindings.
     #[must_use]
     pub fn all_bindings_local(&self) -> bool {
-        // if self.inner.function && self.inn
         self.inner
             .bindings
             .borrow()
@@ -252,7 +271,7 @@ impl Scope {
     /// Check if the scope is a function scope.
     #[must_use]
     pub fn is_function(&self) -> bool {
-        self.inner.function
+        self.inner.kind != ScopeKind::Declarative
     }
 
     /// Check if the scope is a global scope.
@@ -345,7 +364,7 @@ impl Scope {
                 return;
             }
             if let Some(outer) = &current.inner.outer {
-                if current.inner.function {
+                if current.is_function() {
                     crossed_function_border = true;
                 }
                 current = outer;
@@ -355,24 +374,18 @@ impl Scope {
         }
     }
 
-    /// Escape enclosing function environment's `this`.
+    /// Retain the nearest function environment whose `this` is captured by an arrow.
     pub fn escape_this_in_enclosing_function_scope(&self) {
-        let mut current = self;
-        let mut crossed_function_border = false;
+        let mut functions =
+            std::iter::successors(Some(self), |&scope| scope.outer()).filter(|s| s.is_function());
 
-        loop {
-            if crossed_function_border && current.is_function() {
-                current.inner.this_escaped.set(true);
-                return;
-            }
-            if let Some(outer) = &current.inner.outer {
-                if current.is_function() {
-                    crossed_function_border = true;
-                }
-                current = outer;
-            } else {
-                return;
-            }
+        if functions
+            .next()
+            .is_some_and(|scope| scope.inner.kind == ScopeKind::Arrow)
+            && let Some(owner) = functions.find(|scope| scope.inner.kind == ScopeKind::Function)
+            && !owner.is_global()
+        {
+            owner.inner.this_escaped.set(true);
         }
     }
 
