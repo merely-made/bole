@@ -197,13 +197,11 @@ impl GetNameOrUndefined {
         let mut binding_locator =
             context.vm.frame().code_block.bindings[usize::from(index)].clone();
 
-        let is_global = binding_locator.is_global();
-
         context.find_runtime_binding(&mut binding_locator)?;
 
         let result = if let Some(value) = context.get_binding(&binding_locator)? {
             value
-        } else if is_global {
+        } else if binding_locator.is_global() {
             JsValue::undefined()
         } else {
             let name = binding_locator.name().to_std_string_escaped();

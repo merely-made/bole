@@ -454,12 +454,8 @@ impl Context {
     /// Gets the corresponding runtime binding of the provided `BindingLocator`, modifying
     /// its indexes in place.
     ///
-    /// This readjusts a `BindingLocator` to the correct binding if a `with` environment or
-    /// `eval` call modified the compile-time bindings.
-    ///
-    /// Only use if the binding origin is unknown or comes from a `var` declaration. Lexical bindings
-    /// are completely removed of runtime checks because the specification guarantees that runtime
-    /// semantics cannot add or remove lexical bindings.
+    /// This readjusts a `BindingLocator` if a `with` environment or direct `eval` changed
+    /// name resolution, or a later script declared a global lexical binding.
     pub(crate) fn find_runtime_binding(&mut self, locator: &mut BindingLocator) -> JsResult<()> {
         let deleted_binding = self.is_deleted_binding(locator);
 
@@ -469,13 +465,13 @@ impl Context {
             && !env.poisoned()
             && !deleted_binding
         {
+            self.resolve_global_lexical_binding(locator);
             return Ok(());
         }
 
-        let (global, min_index) = match locator.scope() {
-            BindingLocatorScope::GlobalObject | BindingLocatorScope::GlobalDeclarative => (true, 0),
-            BindingLocatorScope::Stack(_) if deleted_binding => (false, 0),
-            BindingLocatorScope::Stack(index) => (false, index),
+        let min_index = match locator.scope() {
+            BindingLocatorScope::Stack(index) if !deleted_binding => index,
+            _ => 0,
         };
         let max_index = self.vm.frame().environments.len() as u32;
 
@@ -494,7 +490,7 @@ impl Context {
                             return Ok(());
                         }
                     } else if !env.with() {
-                        return Ok(());
+                        break;
                     }
                 }
                 Environment::Object(o) => {
@@ -520,6 +516,9 @@ impl Context {
         {
             let mut scope = function_env.compile().outer();
             while let Some(current_scope) = scope {
+                if current_scope.is_global() {
+                    break;
+                }
                 if let Some(binding) = current_scope.get_binding(locator.name()) {
                     locator.set_scope(binding.scope());
                     locator.set_binding_index(binding.binding_index());
@@ -530,18 +529,21 @@ impl Context {
 
             locator.set_scope(BindingLocatorScope::GlobalObject);
             locator.set_binding_index(0);
-            return Ok(());
         }
 
-        if global
-            && self.realm().environment().poisoned()
-            && let Some(b) = self.realm().scope().get_binding(locator.name())
-        {
-            locator.set_scope(b.scope());
-            locator.set_binding_index(b.binding_index());
-        }
-
+        self.resolve_global_lexical_binding(locator);
         Ok(())
+    }
+
+    /// Global lexical bindings shadow global object properties, but an inner
+    /// environment can resolve the name first.
+    fn resolve_global_lexical_binding(&self, locator: &mut BindingLocator) {
+        if locator.is_global()
+            && let Some((slot, _)) = self.realm().global_lexical_binding(locator.name())
+        {
+            locator.set_scope(BindingLocatorScope::GlobalDeclarative);
+            locator.set_binding_index(slot);
+        }
     }
 
     /// Returns the `this` value (`WithBaseObject`) for an already-resolved binding
@@ -673,6 +675,15 @@ impl Context {
                 obj.set(key, value, strict, self)?;
             }
             BindingLocatorScope::GlobalDeclarative => {
+                if matches!(
+                    self.realm().global_lexical_binding(locator.name()),
+                    Some((_, false))
+                ) {
+                    let name = locator.name().to_std_string_escaped();
+                    return Err(JsNativeError::typ()
+                        .with_message(format!("cannot mutate an immutable binding '{name}'"))
+                        .into());
+                }
                 let env = self.vm.frame().realm.environment();
                 env.set(locator.binding_index(), value);
             }

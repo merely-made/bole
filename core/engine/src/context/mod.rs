@@ -940,6 +940,13 @@ impl Context {
             }
         }
 
+        // 15. Instantiate script lexical bindings before initializing global
+        // functions and vars. Their slots remain empty until evaluation.
+        for global_lex in &codeblock.global_lexs {
+            let name = codeblock.constant_string(*global_lex as usize);
+            self.realm().instantiate_global_lexical_binding(name);
+        }
+
         // 16. For each Parse Node f of functionsToInitialize, do
         for fun in &codeblock.global_fns {
             // ...

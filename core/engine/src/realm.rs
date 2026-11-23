@@ -65,6 +65,9 @@ struct Inner {
     // Safety: Nothing in `Scope` needs tracing.
     #[unsafe_ignore_trace]
     scope: Scope,
+    // Runtime declaration metadata. The parser may add names to `scope`
+    // before the corresponding script is evaluated.
+    global_lexical_bindings: GcRefCell<FxHashMap<JsString, (u32, bool)>>,
 
     global_object: JsObject,
 
@@ -109,6 +112,7 @@ impl Realm {
                 intrinsics,
                 environment,
                 scope,
+                global_lexical_bindings: GcRefCell::default(),
                 global_object,
                 global_this: GcRefCell::new(global_this),
                 global_this_fixed: Cell::new(false),
@@ -186,6 +190,31 @@ impl Realm {
     #[must_use]
     pub fn scope(&self) -> &Scope {
         &self.inner.scope
+    }
+
+    /// Returns the slot index and whether an instantiated global lexical binding is mutable.
+    pub(crate) fn global_lexical_binding(&self, name: &JsString) -> Option<(u32, bool)> {
+        self.inner
+            .global_lexical_bindings
+            .borrow()
+            .get(name)
+            .copied()
+    }
+
+    pub(crate) fn instantiate_global_lexical_binding(&self, name: JsString) {
+        let slot = self
+            .scope()
+            .get_binding(&name)
+            .expect("a global lexical declaration has a compile-time slot")
+            .binding_index();
+        let mutable = self
+            .scope()
+            .is_binding_mutable(&name)
+            .expect("a global lexical declaration has compile-time mutability");
+        self.inner
+            .global_lexical_bindings
+            .borrow_mut()
+            .insert(name, (slot, mutable));
     }
 
     pub(crate) fn global_object(&self) -> &JsObject {
