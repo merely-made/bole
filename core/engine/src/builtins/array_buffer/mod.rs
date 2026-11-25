@@ -17,6 +17,7 @@ pub(crate) mod utils;
 mod tests;
 
 use std::ops::{Deref, DerefMut};
+use std::ptr::NonNull;
 
 use aligned_vec::{ABox, AVec, ConstAlign};
 pub use shared::SharedArrayBuffer;
@@ -197,12 +198,83 @@ impl BufferObject {
     }
 }
 
+/// An `ArrayBuffer`'s bytes: its own, or bytes an embedder owns, such as
+/// `WebAssembly` memory. Bole never frees or reallocates foreign bytes; a clone
+/// of them is an owned copy.
+#[derive(Debug)]
+pub(crate) enum Bytes {
+    Owned(AlignedVec<u8>),
+    Foreign { ptr: NonNull<u8>, len: usize },
+}
+
+impl Bytes {
+    fn into_owned(self) -> Option<AlignedVec<u8>> {
+        match self {
+            Self::Owned(vec) => Some(vec),
+            Self::Foreign { .. } => None,
+        }
+    }
+}
+
+impl From<AlignedVec<u8>> for Bytes {
+    fn from(vec: AlignedVec<u8>) -> Self {
+        Self::Owned(vec)
+    }
+}
+
+impl Clone for Bytes {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Owned(vec) => Self::Owned(vec.clone()),
+            Self::Foreign { .. } => Self::Owned(AlignedVec::from_slice(64, self)),
+        }
+    }
+}
+
+impl Deref for Bytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Owned(vec) => vec,
+            // SAFETY: `from_foreign`'s caller keeps the bytes valid while the
+            // buffer holds them.
+            Self::Foreign { ptr, len } => unsafe { std::slice::from_raw_parts(ptr.as_ptr(), *len) },
+        }
+    }
+}
+
+impl DerefMut for Bytes {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        match self {
+            Self::Owned(vec) => vec,
+            // SAFETY: as for `deref`.
+            Self::Foreign { ptr, len } => unsafe {
+                std::slice::from_raw_parts_mut(ptr.as_ptr(), *len)
+            },
+        }
+    }
+}
+
+/// Foreign bytes, or `None` if `ptr` is not aligned to 8 as typed arrays need.
+/// A zero-length block uses an aligned dangling pointer instead of `ptr`.
+fn foreign_bytes(ptr: NonNull<u8>, len: usize) -> Option<Bytes> {
+    let ptr = if len == 0 {
+        NonNull::<u64>::dangling().cast::<u8>()
+    } else if ptr.align_offset(8) != 0 {
+        return None;
+    } else {
+        ptr
+    };
+    Some(Bytes::Foreign { ptr, len })
+}
+
 /// The internal representation of an `ArrayBuffer` object.
 #[derive(Debug, Clone, Trace, Finalize, JsData)]
 pub struct ArrayBuffer {
     /// The `[[ArrayBufferData]]` internal slot.
     #[unsafe_ignore_trace]
-    data: Option<AlignedVec<u8>>,
+    data: Option<Bytes>,
 
     /// The `[[ArrayBufferMaxByteLength]]` internal slot.
     max_byte_len: Option<u64>,
@@ -214,14 +286,86 @@ pub struct ArrayBuffer {
 impl ArrayBuffer {
     pub(crate) fn from_data(data: AlignedVec<u8>, detach_key: JsValue) -> Self {
         Self {
-            data: Some(data),
+            data: Some(data.into()),
             max_byte_len: None,
             detach_key,
         }
     }
 
+    /// A buffer over `len` bytes at `ptr` that the embedder owns, resizable up
+    /// to `max_byte_len` if given. A resize reaches the embedder through
+    /// [`HostHooks::resize_array_buffer`]; Bole never reallocates the bytes.
+    /// Returns `None` if `ptr` is not aligned to 8.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be valid for reads and writes of `len` bytes until the
+    /// buffer is detached or repointed. The embedder must detach or repoint it
+    /// before those bytes move or are freed, and must hold no reference to
+    /// them while script runs.
+    ///
+    /// [`HostHooks::resize_array_buffer`]: crate::context::HostHooks::resize_array_buffer
+    #[must_use]
+    pub unsafe fn from_foreign(
+        ptr: NonNull<u8>,
+        len: usize,
+        max_byte_len: Option<u64>,
+        detach_key: JsValue,
+    ) -> Option<Self> {
+        if max_byte_len.is_some_and(|max| len as u64 > max) {
+            return None;
+        }
+        Some(Self {
+            data: Some(foreign_bytes(ptr, len)?),
+            max_byte_len,
+            detach_key,
+        })
+    }
+
+    /// Point a buffer over embedder-owned bytes at `len` bytes at `ptr`,
+    /// keeping its identity, as after the embedder moved or grew them. Returns
+    /// `false`, changing nothing, if the buffer is detached or owns its bytes,
+    /// if `ptr` is not aligned to 8, or if a resizable buffer's maximum is
+    /// exceeded.
+    ///
+    /// # Safety
+    ///
+    /// As for [`from_foreign`](Self::from_foreign), for the new bytes.
+    #[must_use]
+    pub unsafe fn repoint_foreign(&mut self, ptr: NonNull<u8>, len: usize) -> bool {
+        if !self.is_foreign() || self.max_byte_len.is_some_and(|max| len as u64 > max) {
+            return false;
+        }
+        let Some(bytes) = foreign_bytes(ptr, len) else {
+            return false;
+        };
+        self.data = Some(bytes);
+        true
+    }
+
+    /// Whether the embedder owns this buffer's bytes.
+    #[must_use]
+    pub fn is_foreign(&self) -> bool {
+        matches!(self.data, Some(Bytes::Foreign { .. }))
+    }
+
+    /// Detach a buffer over embedder-owned bytes, which hands nothing back.
+    ///
+    /// # Errors
+    ///
+    /// Throws an error if the provided detach key is invalid.
+    pub fn detach_foreign(&mut self, key: &JsValue) -> JsResult<()> {
+        if !JsValue::same_value(&self.detach_key, key) {
+            return Err(JsNativeError::typ()
+                .with_message("Cannot detach array buffer with different key")
+                .into());
+        }
+        self.data = None;
+        Ok(())
+    }
+
     pub(crate) fn len(&self) -> usize {
-        self.data.as_ref().map_or(0, AlignedVec::len)
+        self.data.as_deref().map_or(0, <[u8]>::len)
     }
 
     pub(crate) fn bytes(&self) -> Option<&[u8]> {
@@ -233,7 +377,10 @@ impl ArrayBuffer {
     }
 
     pub(crate) fn vec_mut(&mut self) -> Option<&mut AlignedVec<u8>> {
-        self.data.as_mut()
+        match self.data.as_mut() {
+            Some(Bytes::Owned(vec)) => Some(vec),
+            _ => None,
+        }
     }
 
     /// Sets the maximum byte length of the buffer, returning the previous value if present.
@@ -275,6 +422,13 @@ impl ArrayBuffer {
                 .into());
         };
 
+        if self.is_foreign() {
+            return Err(JsNativeError::typ()
+                .with_message(
+                    "ArrayBuffer.resize: the host owns this buffer's bytes and did not resize it",
+                )
+                .into());
+        }
         let Some(buf) = self.vec_mut() else {
             return Err(JsNativeError::typ()
                 .with_message("ArrayBuffer.resize: cannot resize a detached buffer")
@@ -306,7 +460,7 @@ impl ArrayBuffer {
                 .into());
         }
 
-        Ok(self.data.take())
+        Ok(self.data.take().and_then(Bytes::into_owned))
     }
 
     /// `IsDetachedBuffer ( arrayBuffer )`
@@ -587,10 +741,30 @@ impl ArrayBuffer {
         // 5. If IsDetachedBuffer(O) is true, throw a TypeError exception.
         // 6. If newByteLength > O.[[ArrayBufferMaxByteLength]], throw a RangeError exception.
 
-        // TODO: 7. Let hostHandled be ? HostResizeArrayBuffer(O, newByteLength).
+        {
+            let data = buf.borrow();
+            let data = data.data();
+            if data.is_detached() {
+                return Err(JsNativeError::typ()
+                    .with_message("ArrayBuffer.resize: cannot resize a detached buffer")
+                    .into());
+            }
+            if data.max_byte_len.is_some_and(|max| new_byte_length > max) {
+                return Err(JsNativeError::range()
+                    .with_message(
+                        "ArrayBuffer.resize: new byte length exceeds buffer's maximum byte length",
+                    )
+                    .into());
+            }
+        }
+
+        // 7. Let hostHandled be ? HostResizeArrayBuffer(O, newByteLength).
         // 8. If hostHandled is handled, return undefined.
-        // Used in engines to handle Wasm buffers in a special way, but we don't
-        // have a Wasm interpreter in place yet.
+        let hooks = context.host_hooks();
+        let buffer = crate::object::builtins::JsArrayBuffer::from(buf.clone());
+        if hooks.resize_array_buffer(&buffer, new_byte_length, context)? {
+            return Ok(JsValue::undefined());
+        }
 
         // 9. Let oldBlock be O.[[ArrayBufferData]].
         // 10. Let newBlock be ? CreateByteDataBlock(newByteLength).
@@ -759,6 +933,12 @@ impl ArrayBuffer {
                 .with_message("cannot transfer a buffer with a detach key")
                 .into());
         }
+        // Bole cannot move bytes an embedder owns into a new buffer.
+        if buf.borrow().data().is_foreign() {
+            return Err(JsNativeError::typ()
+                .with_message("cannot transfer an ArrayBuffer whose bytes the host owns")
+                .into());
+        }
 
         // Effectively, the next steps only create a new object for the same vec, so we can skip all
         // those steps and just make a single check + trigger the realloc.
@@ -799,9 +979,8 @@ impl ArrayBuffer {
             let mut source = buf.borrow_mut();
             let bytes = source
                 .data_mut()
-                .data
-                .as_mut()
-                .expect("the buffer was checked as attached above");
+                .vec_mut()
+                .expect("the buffer was checked as attached and owned above");
             let additional = new_len.saturating_sub(bytes.len());
             bytes.try_reserve_exact(additional).map_err(|error| {
                 let message = match error {
@@ -821,7 +1000,8 @@ impl ArrayBuffer {
             .data_mut()
             .data
             .take()
-            .expect("the buffer was checked as attached above");
+            .and_then(Bytes::into_owned)
+            .expect("the buffer was checked as attached and owned above");
         bytes.resize(new_len, 0);
         // Keep the moved allocation's capacity: aligned-vec's shrink_to_fit uses an infallible
         // realloc path. The excess capacity is not observable from JavaScript.
@@ -836,7 +1016,7 @@ impl ArrayBuffer {
             context.root_shape(),
             prototype,
             ArrayBuffer {
-                data: Some(bytes),
+                data: Some(bytes.into()),
                 max_byte_len: new_max_len,
                 detach_key: JsValue::undefined(),
             },
@@ -889,7 +1069,7 @@ impl ArrayBuffer {
             Self {
                 // 6. Set obj.[[ArrayBufferData]] to block.
                 // 7. Set obj.[[ArrayBufferByteLength]] to byteLength.
-                data: Some(block),
+                data: Some(block.into()),
                 // 8. If allocatingResizableBuffer is true, then
                 //    c. Set obj.[[ArrayBufferMaxByteLength]] to maxByteLength.
                 max_byte_len,

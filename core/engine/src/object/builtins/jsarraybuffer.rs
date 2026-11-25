@@ -223,6 +223,64 @@ impl JsArrayBuffer {
             })
     }
 
+    /// A buffer over `len` bytes at `ptr` that the embedder owns, as
+    /// `WebAssembly` memory is, resizable up to `max_byte_len` if given. Its
+    /// detach key is `detach_key`, so script can neither transfer nor detach
+    /// it while the key is not `undefined`. Returns `None` if `ptr` is not
+    /// aligned to 8.
+    ///
+    /// # Safety
+    ///
+    /// As for [`ArrayBuffer::from_foreign`].
+    ///
+    /// # Errors
+    ///
+    /// If the intrinsic prototype cannot be read.
+    pub unsafe fn from_foreign(
+        ptr: std::ptr::NonNull<u8>,
+        len: usize,
+        max_byte_len: Option<u64>,
+        detach_key: JsValue,
+        context: &mut Context,
+    ) -> JsResult<Option<Self>> {
+        // SAFETY: the caller's contract.
+        let Some(data) = (unsafe { ArrayBuffer::from_foreign(ptr, len, max_byte_len, detach_key) })
+        else {
+            return Ok(None);
+        };
+        let prototype = context
+            .intrinsics()
+            .constructors()
+            .array_buffer()
+            .prototype();
+        let obj = JsObject::new(context.root_shape(), prototype, data);
+        Ok(Some(Self { inner: obj }))
+    }
+
+    /// Repoint a buffer made by [`from_foreign`](Self::from_foreign) at `len`
+    /// bytes at `ptr`; see [`ArrayBuffer::repoint_foreign`].
+    ///
+    /// # Safety
+    ///
+    /// As for [`ArrayBuffer::repoint_foreign`].
+    #[must_use]
+    pub unsafe fn repoint_foreign(&self, ptr: std::ptr::NonNull<u8>, len: usize) -> bool {
+        // SAFETY: the caller's contract.
+        unsafe { self.inner.borrow_mut().data_mut().repoint_foreign(ptr, len) }
+    }
+
+    /// Detach a buffer made by [`from_foreign`](Self::from_foreign).
+    ///
+    /// # Errors
+    ///
+    /// If `detach_key` is not the buffer's.
+    pub fn detach_foreign(&self, detach_key: &JsValue) -> JsResult<()> {
+        self.inner
+            .borrow_mut()
+            .data_mut()
+            .detach_foreign(detach_key)
+    }
+
     /// Get an immutable reference to the [`JsArrayBuffer`]'s data.
     ///
     /// Returns `None` if detached.

@@ -3,7 +3,7 @@ use crate::{
     builtins::{Promise, promise::OperationType},
     context::intrinsics::Intrinsics,
     job::JobCallback,
-    object::{JsFunction, JsObject},
+    object::{JsFunction, JsObject, builtins::JsArrayBuffer},
     realm::Realm,
 };
 use time::{OffsetDateTime, UtcOffset};
@@ -222,6 +222,24 @@ pub trait HostHooks {
     /// [specification]: https://tc39.es/ecma262/#sec-resizable-arraybuffer-guidelines
     fn max_buffer_size(&self, _context: &mut Context) -> u64 {
         1_610_612_736 // 1.5 GiB
+    }
+
+    /// [`HostResizeArrayBuffer ( buffer, newByteLength )`][spec]
+    ///
+    /// Called by `ArrayBuffer.prototype.resize` once `new_byte_length` is known
+    /// to be within the buffer's maximum. A host that owns the buffer's bytes
+    /// (see [`ArrayBuffer::from_foreign`]) resizes it here and returns `true`,
+    /// "handled"; the default returns `false` and leaves the resize to Bole.
+    ///
+    /// [spec]: https://tc39.es/ecma262/#sec-hostresizearraybuffer
+    /// [`ArrayBuffer::from_foreign`]: crate::builtins::array_buffer::ArrayBuffer::from_foreign
+    fn resize_array_buffer(
+        &self,
+        _buffer: &JsArrayBuffer,
+        _new_byte_length: u64,
+        _context: &mut Context,
+    ) -> JsResult<bool> {
+        Ok(false)
     }
 }
 
